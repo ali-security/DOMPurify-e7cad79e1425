@@ -260,6 +260,16 @@ function createDOMPurify(window = getGlobal()) {
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
 
+  /* Pristine allowlist bindings captured whenever the configuration is
+   * parsed (and therefore also at setConfig() time). Where sanitize() skips
+   * re-deriving the sets - the persistent setConfig() path, or a repeated
+   * call with the very same config object - they are restored from these
+   * before the per-walk hook clone-guard, so a hook's in-call widening
+   * cannot carry across calls. Null until the config is parsed; reset by
+   * clearConfig(). */
+  let PRISTINE_ALLOWED_TAGS = null;
+  let PRISTINE_ALLOWED_ATTR = null;
+
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
   let FORCE_BODY = false;
@@ -410,6 +420,13 @@ function createDOMPurify(window = getGlobal()) {
   // eslint-disable-next-line complexity
   const _parseConfig = function (cfg) {
     if (CONFIG && CONFIG === cfg) {
+      /* The sets are not re-derived on this path. CONFIG is handed to the
+       * hooks as their third argument, so a caller can pass it straight back
+       * in - restore the sets from the pristine bindings captured when this
+       * config was parsed, otherwise a previous call's hook clone (widened by
+       * a hook) would carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
       return;
     }
 
@@ -606,6 +623,12 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     CONFIG = cfg;
+
+    /* Capture the freshly derived allowlists. sanitize() restores the sets
+     * from these whenever it skips re-deriving them, keeping a hook's
+     * in-call widening scoped to the call it happened in. */
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   const MATHML_TEXT_INTEGRATION_POINTS = addToSet({}, [
@@ -938,6 +961,37 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _forkSharedAllowlist
+   * Fork a hook-mutable allowlist off its shared binding the first time a
+   * (possibly lazily-installed) uponSanitize* hook is about to see it, so the
+   * hook cannot widen the default or the setConfig()/parsed binding by
+   * reference and leak past the call. Returns the set unchanged once it is
+   * already call-local, so repeated calls across elements are idempotent.
+   * The `hooks` object is populated on demand, so the hook array may be
+   * absent.
+   *
+   * @param  {String} entryPoint  Name of the uponSanitize* hook's entry point
+   * @param  {Object} set  the current ALLOWED_TAGS / ALLOWED_ATTR binding
+   * @param  {Object} defaultSet  the per-instance DEFAULT_ALLOWED_* constant
+   * @param  {Object} pristineSet  the captured PRISTINE_ALLOWED_* binding, or
+   *   null; restored when the same config object is handed back
+   * @return {Object} a call-local clone if a hook is registered and set is
+   *   still a shared binding, else set unchanged
+   */
+  const _forkSharedAllowlist = function (
+    entryPoint,
+    set,
+    defaultSet,
+    pristineSet
+  ) {
+    if (!hooks[entryPoint] || hooks[entryPoint].length === 0) {
+      return set;
+    }
+
+    return set === defaultSet || set === pristineSet ? clone(set) : set;
+  };
+
+  /**
    * _executeHook
    * Execute user configurable hooks
    *
@@ -985,6 +1039,18 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Now let's check the element's type and name */
     const tagName = transformCaseFunc(currentNode.nodeName);
+
+    /* An uponSanitizeElement hook may have been registered after the
+       pre-walk clone-guard sampled the hook arrays (e.g. lazily from
+       beforeSanitizeElements), leaving ALLOWED_TAGS still aliasing a shared
+       binding that a widening hook would mutate by reference. Fork it before
+       exposing it to the hook. */
+    ALLOWED_TAGS = _forkSharedAllowlist(
+      'uponSanitizeElement',
+      ALLOWED_TAGS,
+      DEFAULT_ALLOWED_TAGS,
+      PRISTINE_ALLOWED_TAGS
+    );
 
     /* Execute a hook if present */
     _executeHook('uponSanitizeElement', currentNode, {
@@ -1234,6 +1300,16 @@ function createDOMPurify(window = getGlobal()) {
       return;
     }
 
+    /* Same lazy-registration guard as uponSanitizeElement (see there): fork
+       the attribute allowlist off its shared binding before a hook can see
+       it. */
+    ALLOWED_ATTR = _forkSharedAllowlist(
+      'uponSanitizeAttribute',
+      ALLOWED_ATTR,
+      DEFAULT_ALLOWED_ATTR,
+      PRISTINE_ALLOWED_ATTR
+    );
+
     const hookEvent = {
       attrName: '',
       attrValue: '',
@@ -1444,7 +1520,14 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     /* Assign config vars */
-    if (!SET_CONFIG) {
+    if (SET_CONFIG) {
+      /* Persistent setConfig() path: _parseConfig is skipped, so the sets are
+       * not re-derived per call. Restore them from the pristine bindings
+       * captured at setConfig() time so a previous call's hook clone (mutated
+       * below) does not carry over. */
+      ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+      ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
+    } else {
       _parseConfig(cfg);
     }
 
@@ -1602,6 +1685,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.setConfig = function (cfg) {
     _parseConfig(cfg);
     SET_CONFIG = true;
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
   };
 
   /**
@@ -1612,6 +1697,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    PRISTINE_ALLOWED_TAGS = null;
+    PRISTINE_ALLOWED_ATTR = null;
   };
 
   /**
