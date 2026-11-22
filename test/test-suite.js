@@ -516,6 +516,306 @@
         );
       }
     );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES with RETURN_DOM and RETURN_DOM_FRAGMENT',
+      function (assert) {
+        // Template expressions assembled from adjacent text nodes (left over
+        // after element removal) have to be stripped when a DOM is returned,
+        // just like they are in string mode. See CVE-2026-41239.
+        var mustache =
+          "{<foo></foo>{constructor.constructor('alert(1)')()}<foo></foo>}";
+        var tmplit = '$<foo></foo>{alert(1)}';
+        var serializeFragment = function (fragment) {
+          var div = fragment.ownerDocument.createElement('div');
+          div.appendChild(fragment);
+          return div.innerHTML;
+        };
+
+        // String mode strips the assembled expression
+        assert.equal(
+          DOMPurify.sanitize(mustache, { SAFE_FOR_TEMPLATES: true }),
+          ' '
+        );
+
+        // RETURN_DOM
+        var dom = DOMPurify.sanitize(mustache, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\{\{/.test(dom.innerHTML), 'no mustache: ' + dom.innerHTML);
+        assert.equal(dom.outerHTML, '<body> </body>');
+
+        dom = DOMPurify.sanitize(tmplit, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\$\{/.test(dom.innerHTML), 'no ${: ' + dom.innerHTML);
+        assert.equal(dom.outerHTML, '<body> </body>');
+
+        // RETURN_DOM_FRAGMENT
+        var fragment = DOMPurify.sanitize(mustache, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        });
+        assert.equal(fragment.nodeType, 11);
+        var html = serializeFragment(fragment);
+        assert.notOk(/\{\{/.test(html), 'no mustache in fragment: ' + html);
+        assert.equal(html, ' ');
+
+        fragment = DOMPurify.sanitize(tmplit, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM_FRAGMENT: true,
+        });
+        html = serializeFragment(fragment);
+        assert.notOk(/\$\{/.test(html), 'no ${ in fragment: ' + html);
+        assert.equal(html, ' ');
+
+        // A DOM node passed in is cleaned as well
+        var input = document.createElement('div');
+        input.innerHTML = '{<foo></foo>{alert(1)}<foo></foo>}';
+        dom = DOMPurify.sanitize(input, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(/\{\{/.test(dom.innerHTML), 'no mustache: ' + dom.innerHTML);
+        assert.notOk(/alert/.test(dom.innerHTML), 'no payload: ' + dom.innerHTML);
+
+        // Safe markup is kept and nothing changes without SAFE_FOR_TEMPLATES
+        assert.equal(
+          DOMPurify.sanitize('<a>123<b>456</b></a>', {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          }).outerHTML,
+          '<body><a>123<b>456</b></a></body>'
+        );
+        assert.equal(
+          DOMPurify.sanitize('{<foo></foo>{1}<foo></foo>}', {
+            RETURN_DOM: true,
+          }).innerHTML,
+          '{{1}}'
+        );
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning Mustache expressions in IN_PLACE mode',
+      function (assert) {
+        // The IN_PLACE counterpart of CVE-2026-41239: each text node holds
+        // only a single '{' or '}' until the stripped <foo> elements between
+        // them are gone, so the per-node strip matches nothing and the merged
+        // '{{...}}' would survive in the caller's live tree.
+        var dirty = document.createElement('div');
+        dirty.innerHTML =
+          '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+        var clean = DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          IN_PLACE: true,
+        });
+        assert.equal(clean, dirty, 'returns the same in-place node');
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(dirty.innerHTML),
+          'merged Mustache expression is scrubbed'
+        );
+        assert.notOk(
+          /constructor/.test(dirty.innerHTML),
+          'expression body does not survive'
+        );
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES scrub does not reparse DOM-built markup',
+      function (assert) {
+        // The final scrub rewrites character data; it must not serialize the
+        // tree and write it back through innerHTML, which would turn a
+        // DOM-built <style> holding '</style><img onerror>' into live,
+        // never-sanitized elements and replace every node the caller holds.
+        var payload = '</style><img src=x onerror=alert(1)>';
+        var dirty = document.createElement('div');
+        var style = document.createElement('style');
+        style.appendChild(document.createTextNode(payload));
+        dirty.appendChild(style);
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.equal(
+          dirty.getElementsByTagName('img').length,
+          0,
+          'IN_PLACE scrub does not create elements'
+        );
+
+        dirty = document.createElement('div');
+        dirty.innerHTML = '<p>{<foo></foo>{x}<foo></foo>}</p>';
+        var p = dirty.firstChild;
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.equal(dirty.firstChild, p, 'node references are kept');
+        assert.notOk(/\{\{/.test(dirty.innerHTML), 'expression is scrubbed');
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES scrubs split expressions in template content',
+      function (assert) {
+        // NodeIterator does not enter <template>.content, so the final scrub
+        // recurses into it explicitly.
+        var probe = document.createElement('template');
+        if (!probe.content || probe.content.nodeType !== 11) {
+          assert.ok(true, 'no template support');
+          return;
+        }
+
+        var clean = DOMPurify.sanitize(
+          '<template>{<foo></foo>{x()}<foo></foo>}</template>',
+          { SAFE_FOR_TEMPLATES: true, RETURN_DOM: true, FORCE_BODY: true }
+        );
+        var content = clean.getElementsByTagName('template')[0].content;
+        assert.notOk(/\{\{/.test(content.textContent), 'RETURN_DOM');
+
+        var dirty = document.createElement('div');
+        var template = document.createElement('template');
+        template.content.appendChild(document.createTextNode('{'));
+        template.content.appendChild(document.createElement('foo'));
+        template.content.appendChild(document.createTextNode('{x()}'));
+        template.content.appendChild(document.createElement('foo'));
+        template.content.appendChild(document.createTextNode('}'));
+        dirty.appendChild(template);
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.notOk(/\{\{/.test(template.content.textContent), 'IN_PLACE');
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning template-literal expressions in IN_PLACE mode',
+      function (assert) {
+        // Same bug class as above, for ES template literals: '$' and '{' land
+        // in separate text nodes, so TMPLIT_EXPR (which requires the paired
+        // '${' sigil) does not match per node — but the serialized output
+        // contains '${...}'.
+        var dirty = document.createElement('div');
+        dirty.innerHTML = '$<foo></foo>{<foo></foo>danger}';
+        DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          IN_PLACE: true,
+        });
+        assert.notOk(
+          /\$\{[\s\S]*\}/.test(dirty.innerHTML),
+          'merged template-literal expression should be scrubbed'
+        );
+      }
+    );
+
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES pins RETURN_DOM_FRAGMENT scrub behavior',
+      function (assert) {
+        // RETURN_DOM_FRAGMENT was fixed alongside RETURN_DOM in CVE-2026-41239
+        // (both reach the body.innerHTML scrub). Pinning the fragment path
+        // here so future refactors of the post-walk return logic do not
+        // silently regress it.
+        var result = DOMPurify.sanitize(
+          '<div>{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}</div>',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM_FRAGMENT: true,
+          }
+        );
+        var container = document.createElement('div');
+        container.appendChild(result);
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(container.innerHTML),
+          'merged Mustache expression should be scrubbed in fragment mode'
+        );
+      }
+    );
+
+    QUnit.test(
+      'RETURN_DOM scrubs boundary-spanning expressions inside template.content',
+      (assert) => {
+        // _scrubTemplateExpressions uses a NodeIterator rooted at the output
+        // body. Per the DOM spec, NodeIterator does not descend into
+        // <template>.content, which is a separate DocumentFragment outside
+        // the normal child-node tree. Stripped foreign elements inside a
+        // <template> leave adjacent text nodes in template.content whose
+        // individual fragments ('$' and '{...}') do not match TMPLIT_EXPR,
+        // but merge into a full '${...}' after normalize(). The fix
+        // explicitly recurses into each template.content, mirroring the
+        // approach already used by _sanitizeShadowDOM.
+        const dirty = document.createElement('div');
+        const tmpl = document.createElement('template');
+        tmpl.content.appendChild(document.createTextNode('$'));
+        tmpl.content.appendChild(
+          document.createTextNode('{constructor.constructor("alert(1)")()')
+        );
+        dirty.appendChild(tmpl);
+
+        const result = DOMPurify.sanitize(dirty, {
+          RETURN_DOM: true,
+          SAFE_FOR_TEMPLATES: true,
+        });
+
+        result.querySelector('template').content.normalize();
+        assert.notOk(
+          /\$\{[\s\S]*\}/.test(
+            result.querySelector('template').content.textContent
+          ),
+          'merged template-literal expression inside template.content should be scrubbed'
+        );
+      }
+    );
+
+    QUnit.test(
+      'IN_PLACE scrubs boundary-spanning expressions inside template.content',
+      (assert) => {
+        // Same blind spot as the RETURN_DOM case above, but for the IN_PLACE
+        // path. The fix must cover both since they share _scrubTemplateExpressions.
+        const dirty = document.createElement('div');
+        const tmpl = document.createElement('template');
+        tmpl.content.appendChild(document.createTextNode('$'));
+        tmpl.content.appendChild(
+          document.createTextNode('{constructor.constructor("alert(1)")()')
+        );
+        dirty.appendChild(tmpl);
+
+        DOMPurify.sanitize(dirty, {
+          IN_PLACE: true,
+          SAFE_FOR_TEMPLATES: true,
+        });
+
+        dirty.querySelector('template').content.normalize();
+        assert.notOk(
+          /\$\{[\s\S]*\}/.test(
+            dirty.querySelector('template').content.textContent
+          ),
+          'merged template-literal expression inside template.content should be scrubbed in-place'
+        );
+      }
+    );
+
+    QUnit.test('scrub recurses into nested template.content', (assert) => {
+      // A <template> inside a <template> produces two nested
+      // DocumentFragments, both invisible to a flat NodeIterator. The
+      // recursive fix must descend through each level.
+      const dirty = document.createElement('div');
+      const outer = document.createElement('template');
+      const inner = document.createElement('template');
+      inner.content.appendChild(document.createTextNode('$'));
+      inner.content.appendChild(
+        document.createTextNode('{constructor.constructor("alert(1)")()')
+      );
+      outer.content.appendChild(inner);
+      dirty.appendChild(outer);
+
+      const result = DOMPurify.sanitize(dirty, {
+        RETURN_DOM: true,
+        SAFE_FOR_TEMPLATES: true,
+      });
+
+      const innerAfter = result
+        .querySelector('template')
+        .content.querySelector('template');
+      innerAfter.content.normalize();
+      assert.notOk(
+        /\$\{[\s\S]*\}/.test(innerAfter.content.textContent),
+        'merged expression inside nested template.content should be scrubbed'
+      );
+    });
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(

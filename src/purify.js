@@ -1447,6 +1447,60 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _scrubTemplateExpressions
+   * Strip template-engine expressions ({{...}}, <%...%>, ${...}) from the
+   * character data of a subtree. Used as the final safety net for
+   * SAFE_FOR_TEMPLATES on every DOM-returning code path, so that expressions
+   * which only form after text-node normalization (e.g. fragments split across
+   * stripped elements) cannot survive into a template-evaluating framework.
+   *
+   * Walks text/comment/CDATA/processing-instruction nodes and rewrites their
+   * `.data` in place instead of round-tripping through innerHTML. Writing
+   * serialized markup back reparses it: the text of a DOM-built rawtext
+   * element (e.g. a <style> holding `</style><img onerror=...>`) would come
+   * back as live, never-sanitized elements, and every descendant the caller
+   * holds a reference to would be replaced. NodeIterator does not enter
+   * <template>.content, so each template's content is scrubbed explicitly.
+   *
+   * @param  {Node} node The root node whose character data should be scrubbed
+   */
+  const _scrubTemplateExpressions = function (node) {
+    node.normalize();
+    const walker = createNodeIterator.call(
+      node.ownerDocument || node,
+      node,
+      // eslint-disable-next-line no-bitwise
+      NodeFilter.SHOW_ELEMENT |
+        NodeFilter.SHOW_TEXT |
+        NodeFilter.SHOW_COMMENT |
+        NodeFilter.SHOW_CDATA_SECTION |
+        NodeFilter.SHOW_PROCESSING_INSTRUCTION,
+      null,
+      false
+    );
+
+    let currentNode;
+    while ((currentNode = walker.nextNode())) {
+      if (currentNode.nodeType === 1) {
+        const { content } = currentNode;
+        if (content && content.nodeType === 11) {
+          _scrubTemplateExpressions(content);
+        }
+
+        continue;
+      }
+
+      let { data } = currentNode;
+      arrayForEach([MUSTACHE_EXPR, ERB_EXPR, TMPLIT_EXPR], (expr) => {
+        data = stringReplace(data, expr, ' ');
+      });
+      if (currentNode.data !== data) {
+        currentNode.data = data;
+      }
+    }
+  };
+
+  /**
    * _sanitizeShadowDOM
    *
    * @param  {DocumentFragment} fragment to iterate over recursively
@@ -1627,6 +1681,10 @@ function createDOMPurify(window = getGlobal()) {
 
     oldNode = null;
 
+    if (IN_PLACE && SAFE_FOR_TEMPLATES) {
+      _scrubTemplateExpressions(dirty);
+    }
+
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {
       return dirty;
@@ -1634,6 +1692,10 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Return sanitized string or DOM */
     if (RETURN_DOM) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(body);
+      }
+
       if (RETURN_DOM_FRAGMENT) {
         returnNode = createDocumentFragment.call(body.ownerDocument);
 
