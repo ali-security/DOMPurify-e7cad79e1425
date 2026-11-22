@@ -1333,6 +1333,15 @@ function createDOMPurify(window = getGlobal()) {
       _executeHook('uponSanitizeAttribute', currentNode, hookEvent);
       value = hookEvent.attrValue;
 
+      /* Make sure we cannot easily use animated hrefs, even if animations are allowed */
+      if (
+        stringToLowerCase(lcName) === 'attributename' &&
+        stringMatch(value, 'href')
+      ) {
+        _removeAttribute(name, currentNode);
+        continue;
+      }
+
       /* Did the hooks approve of the attribute? */
       if (hookEvent.forceKeepAttr) {
         continue;
